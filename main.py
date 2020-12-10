@@ -13,14 +13,16 @@ import argparse
 
 from models import *
 from utils import progress_bar
-
+import wandb
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
+parser.add_argument('--wandb_name', default="", type=str, help='wandb project name')
 parser.add_argument('--resume', '-r', action='store_true',
                     help='resume from checkpoint')
 args = parser.parse_args()
 
+wandb.init(project="EASGD", name=args.wandb_name, config=args)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 best_acc = 0  # best test accuracy
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
@@ -74,6 +76,8 @@ if device == 'cuda':
     net = torch.nn.DataParallel(net)
     cudnn.benchmark = True
 
+wandb.watch(net)
+
 if args.resume:
     # Load checkpoint.
     print('==> Resuming from checkpoint..')
@@ -84,10 +88,8 @@ if args.resume:
     start_epoch = checkpoint['epoch']
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=args.lr,
-                      momentum=0.9, weight_decay=5e-4)
+optimizer = optim.SGD(net.parameters(), lr=args.lr, weight_decay=5e-4, momentum=0.9) # momentum=0.9
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
-
 
 # Training
 def train(epoch):
@@ -133,6 +135,8 @@ def test(epoch):
             progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
                          % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
+    wandb.log({"Test loss": test_loss, "Test acc": 100.*correct/total})
+
     # Save checkpoint.
     acc = 100.*correct/total
     if acc > best_acc:
@@ -147,6 +151,8 @@ def test(epoch):
         torch.save(state, './checkpoint/ckpt.pth')
         best_acc = acc
 
+        wandb.run.summary["Best Test loss"] = test_loss
+        wandb.run.summary["Best Test acc"]  = best_acc
 
 for epoch in range(start_epoch, start_epoch+200):
     train(epoch)
