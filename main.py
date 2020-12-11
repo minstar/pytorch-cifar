@@ -10,22 +10,32 @@ import torchvision.transforms as transforms
 
 import os
 import argparse
+import copy
 
 from models import *
 from utils import progress_bar
 import wandb
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
+parser.add_argument('--train_batch_size', default=128, type=int, help='comm')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
 parser.add_argument('--wandb_name', default="", type=str, help='wandb project name')
 parser.add_argument('--resume', '-r', action='store_true',
                     help='resume from checkpoint')
+parser.add_argument('--n_workers', default=1, type=int, help='comm')
+parser.add_argument('--alpha', default=0.01, type=float, help='moving rate')
+parser.add_argument('--beta', default=0.9, type=float, help='alpha * lr')
+parser.add_argument('--tau', default=4, type=int, help='communication period')
+parser.add_argument('--rho', default=0.9, type=float, help='momentum')
 args = parser.parse_args()
 
 wandb.init(project="EASGD", name=args.wandb_name, config=args)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 best_acc = 0  # best test accuracy
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
+
+# each local worker should have the same batch size.
+assert args.train_batch_size % args.n_workers == 0
 
 # Data
 print('==> Preparing data..')
@@ -44,7 +54,7 @@ transform_test = transforms.Compose([
 trainset = torchvision.datasets.CIFAR10(
     root='./data', train=True, download=True, transform=transform_train)
 trainloader = torch.utils.data.DataLoader(
-    trainset, batch_size=128, shuffle=True, num_workers=2)
+    trainset, batch_size=args.train_batch_size, shuffle=True, num_workers=2)
 
 testset = torchvision.datasets.CIFAR10(
     root='./data', train=False, download=True, transform=transform_test)
@@ -70,61 +80,90 @@ print('==> Building model..')
 # net = ShuffleNetV2(1)
 # net = EfficientNetB0()
 # net = RegNetX_200MF()
-net = SimpleDLA()
-net = net.to(device)
-if device == 'cuda':
-    net = torch.nn.DataParallel(net)
-    cudnn.benchmark = True
 
-wandb.watch(net)
+master_net = SimpleDLA()
+master_net = master_net.to(device)
+local_nets = []
 
-if args.resume:
-    # Load checkpoint.
-    print('==> Resuming from checkpoint..')
-    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
-    checkpoint = torch.load('./checkpoint/ckpt.pth')
-    net.load_state_dict(checkpoint['net'])
-    best_acc = checkpoint['acc']
-    start_epoch = checkpoint['epoch']
+for i in range(args.n_workers):
+    local_nets += [copy.deepcopy(master_net).to(device)]
+    
+# if device == 'cuda':
+#     net = torch.nn.DataParallel(net)
+#     cudnn.benchmark = True
+
+# if args.resume:
+#     # Load checkpoint.
+#     print('==> Resuming from checkpoint..')
+#     assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
+#     checkpoint = torch.load('./checkpoint/ckpt.pth')
+#     net.load_state_dict(checkpoint['net'])
+#     best_acc = checkpoint['acc']
+#     start_epoch = checkpoint['epoch']
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=args.lr, weight_decay=5e-4, momentum=0.9) # momentum=0.9
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+
+for i in range(args.n_workers):
+    if i == 0:
+        params =  list(local_nets[i].parameters())
+    else:
+        params += list(local_nets[i].parameters())
+optimizer  = optim.SGD(params, lr=args.lr, weight_decay=5e-4, momentum=args.rho) # momentum=0.9
+scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
 # Training
 def train(epoch):
     print('\nEpoch: %d' % epoch)
-    net.train()
-    train_loss = 0
-    correct = 0
-    total = 0
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
-        inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad()
-        outputs = net(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
+    for i in range(args.n_workers):
+        local_nets[i].train()
+        train_loss = 0
+        correct = 0
+        total = 0
+        for batch_idx, (inputs, targets) in enumerate(trainloader):
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            bin_size = inputs.size()[0] // args.n_workers
 
-        train_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
+            #communication    
+            if (batch_idx + 1) % args.tau == 0:
+                sd_master = master_net.state_dict()
+                for key in sd_master:
+                    value = (1 - args.beta) * sd_master[key]
+                    sd_master[key].copy_(value)
+                for i in range(args.n_workers):
+                    sd_loc = local_nets[i].state_dict()
+                    sd_cur = copy.deepcopy(sd_loc)
+                    for key in sd_loc:
+                        loc_value    = sd_loc[key] - args.alpha * (sd_loc[key] - sd_master[key])
+                        sd_loc[key].copy_(loc_value)
+                        master_value = sd_master[key] + args.beta * sd_cur[key] / args.n_workers
+                        sd_master[key].copy_(master_value)
+                        
+            # update each worker
+            for i in range(args.n_workers):
+                outputs = local_nets[i](inputs[i * bin_size : (i+1) * bin_size, :,:,:])
+                loss = criterion(outputs, targets[i * bin_size : (i+1) * bin_size])
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets[i * bin_size : (i+1) * bin_size]).sum().item()      
 
-        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+            progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                        % (train_loss/(batch_idx+1)/args.n_workers, 100.*correct/total/args.n_workers, correct, total))
 
 
 def test(epoch):
     global best_acc
-    net.eval()
+    master_net.eval()
     test_loss = 0
     correct = 0
     total = 0
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(testloader):
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = net(inputs)
+            outputs = master_net(inputs)
             loss = criterion(outputs, targets)
 
             test_loss += loss.item()
@@ -142,7 +181,7 @@ def test(epoch):
     if acc > best_acc:
         print('Saving..')
         state = {
-            'net': net.state_dict(),
+            'net': master_net.state_dict(),
             'acc': acc,
             'epoch': epoch,
         }
