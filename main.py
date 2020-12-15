@@ -10,6 +10,7 @@ import torchvision.transforms as transforms
 
 import os
 import argparse
+import pdb
 import copy
 
 from models import *
@@ -23,9 +24,9 @@ parser.add_argument('--wandb_name', default="", type=str, help='wandb project na
 parser.add_argument('--resume', '-r', action='store_true',
                     help='resume from checkpoint')
 parser.add_argument('--n_workers', default=1, type=int, help='comm')
-parser.add_argument('--alpha', default=0.01, type=float, help='moving rate')
+parser.add_argument('--alpha', default=0.001, type=float, help='moving rate')
 parser.add_argument('--beta', default=0.9, type=float, help='alpha * lr')
-parser.add_argument('--tau', default=4, type=int, help='communication period')
+parser.add_argument('--tau', default=10, type=int, help='communication period')
 parser.add_argument('--rho', default=0.9, type=float, help='momentum')
 args = parser.parse_args()
 
@@ -108,6 +109,8 @@ for i in range(args.n_workers):
         params =  list(local_nets[i].parameters())
     else:
         params += list(local_nets[i].parameters())
+
+# params += list(master_net.parameters())
 optimizer  = optim.SGD(params, lr=args.lr, weight_decay=5e-4, momentum=args.rho) # momentum=0.9
 scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
@@ -116,42 +119,50 @@ def train(epoch):
     print('\nEpoch: %d' % epoch)
     for i in range(args.n_workers):
         local_nets[i].train()
-        train_loss = 0
-        correct = 0
-        total = 0
-        for batch_idx, (inputs, targets) in enumerate(trainloader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
-            bin_size = inputs.size()[0] // args.n_workers
+    master_net.train()
+    # for i in range(args.n_workers):
+        # local_nets[i].train()
+    train_loss = 0
+    correct = 0
+    total = 0
+    for batch_idx, (inputs, targets) in enumerate(trainloader):
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        bin_size = inputs.size()[0] // args.n_workers
 
-            #communication    
-            if (batch_idx + 1) % args.tau == 0:
-                sd_master = master_net.state_dict()
-                for key in sd_master:
-                    value = (1 - args.beta) * sd_master[key]
-                    sd_master[key].copy_(value)
-                for i in range(args.n_workers):
-                    sd_loc = local_nets[i].state_dict()
-                    sd_cur = copy.deepcopy(sd_loc)
-                    for key in sd_loc:
-                        loc_value    = sd_loc[key] - args.alpha * (sd_loc[key] - sd_master[key])
-                        sd_loc[key].copy_(loc_value)
-                        master_value = sd_master[key] + args.beta * sd_cur[key] / args.n_workers
-                        sd_master[key].copy_(master_value)
-                        
-            # update each worker
+        #communication    
+        if (batch_idx + 1) % args.tau == 0:
+            sd_master = master_net.state_dict()
+            for key in sd_master:
+                value = (1 - args.beta) * sd_master[key]
+                sd_master[key].copy_(value)
             for i in range(args.n_workers):
-                outputs = local_nets[i](inputs[i * bin_size : (i+1) * bin_size, :,:,:])
-                loss = criterion(outputs, targets[i * bin_size : (i+1) * bin_size])
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets[i * bin_size : (i+1) * bin_size]).sum().item()      
+                sd_loc = local_nets[i].state_dict()
+                sd_cur = copy.deepcopy(sd_loc)
+                for key in sd_loc:
+                    loc_value    = sd_loc[key] - args.alpha * (sd_loc[key] - sd_master[key])
+                    sd_loc[key].copy_(loc_value)
+                    master_value = sd_master[key] + args.beta * sd_cur[key] / args.n_workers
+                    sd_master[key].copy_(master_value)
+                    
+        # update each worker
+        for num_idx in range(args.n_workers):
+            outputs = local_nets[num_idx](inputs[num_idx * bin_size : (num_idx+1) * bin_size, :,:,:])
+            loss = criterion(outputs, targets[num_idx * bin_size : (num_idx+1) * bin_size])
+            # outputs = master_net(inputs)
+            # loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
 
-            progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                        % (train_loss/(batch_idx+1)/args.n_workers, 100.*correct/total/args.n_workers, correct, total))
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            # correct += predicted.eq(targets).sum().item()
+            correct += predicted.eq(targets[num_idx * bin_size : (num_idx+1) * bin_size]).sum().item()      
+
+        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+                    # % (train_loss/(batch_idx+1)/args.n_workers, 100.*correct/total/args.n_workers, correct, total))
 
 
 def test(epoch):
